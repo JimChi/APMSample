@@ -1,43 +1,55 @@
 using Elastic.Apm.SerilogEnricher;
 using Elastic.CommonSchema.Serilog;
 using Serilog;
+using Serilog.Events; // 新增引用，用於 LogEvent
 using Serilog.Sinks.Elasticsearch;
-using System.Reflection;
 
-// [除錯用] 若 Serilog 內部發生錯誤（如寫入檔案失敗），錯誤會顯示在 Console
+// [除錯用] 若 Serilog 內部發生錯誤，顯示在 Console
 Serilog.Debugging.SelfLog.Enable(msg => Console.WriteLine($"[Serilog Error] {msg}"));
 
 var builder = WebApplication.CreateBuilder(args);
 var mName = Environment.MachineName;
+
 // ==========================================
 // 1. 設定 Serilog (核心設定)
 // ==========================================
 Log.Logger = new LoggerConfiguration()
-    .ReadFrom.Configuration(builder.Configuration) // 讀取 appsettings.json 中的過濾規則
-    .Enrich.FromLogContext()
+    .ReadFrom.Configuration(builder.Configuration)
+    .Enrich.FromLogContext() // [絕對關鍵] 必須有這行，Controller 推送的屬性才能被 Filter 讀到
     .Enrich.WithMachineName()
-    .Enrich.WithElasticApmCorrelationInfo() // [關鍵] 自動注入 APM TraceId，實現 Log 與 APM 的串接
-    .WriteTo.Console() // 保留 Console 輸出，方便開發時除錯
-    .WriteTo.File(
-        formatter: new EcsTextFormatter(),     // [關鍵] 產出符合 Elastic Common Schema 的 JSON
-        path: $@"logs/{mName}log-.json",       // 檔案路徑，Serilog 會自動在 - 後面補上日期
-        rollingInterval: RollingInterval.Day,  // 設定以「天」為單位切割檔案
-        encoding: System.Text.Encoding.UTF8,   // 明確指定 UTF8 避免亂碼
-        shared: true)                          // [關鍵] 允許 Filebeat 或其他程序同時讀取此檔案 (避免鎖死)
-     // ---------------------------------------------------------------------------------
-     // [暫存] 原本的 Elasticsearch 設定 (目前無 ELK 環境，先註解保留)
-     // ---------------------------------------------------------------------------------
-     .WriteTo.Elasticsearch(new ElasticsearchSinkOptions(new Uri(builder.Configuration["Elasticsearch:Uri"] ?? "http://localhost:9200"))
-     {
-         // 使用 ECS 格式，確保 Kibana 能正確解析欄位
-         CustomFormatter = new EcsTextFormatter(),
+    .Enrich.WithElasticApmCorrelationInfo()
+    .WriteTo.Console() // 保留原本功能
+    .WriteTo.File(     // 保留原本功能
+        formatter: new EcsTextFormatter(),
+        path: $@"logs/{mName}log-.json",
+        rollingInterval: RollingInterval.Day,
+        encoding: System.Text.Encoding.UTF8,
+        shared: true)
 
-         // Index 名稱格式
-         IndexFormat = $"ap-logs-{Assembly.GetExecutingAssembly().GetName().Name!.ToLower().Replace(".", "-")}-{DateTime.UtcNow:yyyy.MM.dd}",
-         AutoRegisterTemplate = true,
-         NumberOfShards = 1,
-         NumberOfReplicas = 0
-     })
+    // ---------------------------------------------------------------------------------
+    // [修改重點] 依據業務情境 (Department, InsuranceType) 分流寫入不同 Index
+    // ---------------------------------------------------------------------------------
+
+    // 通道 1: B2C - CAR -> 寫入 ap-logs-b2c-car-yyyy.MM.dd
+    .WriteTo.Logger(lc => lc
+        .Filter.ByIncludingOnly(e => IsMatching(e, "B2C", "CAR"))
+        .WriteTo.Elasticsearch(GetSinkOptions(builder.Configuration, "b2c", "car")))
+
+    // 通道 2: MIS - CAR -> 寫入 ap-logs-mis-car-yyyy.MM.dd
+    .WriteTo.Logger(lc => lc
+        .Filter.ByIncludingOnly(e => IsMatching(e, "MIS", "CAR"))
+        .WriteTo.Elasticsearch(GetSinkOptions(builder.Configuration, "mis", "car")))
+
+    // 通道 3: B2B - CAR -> 寫入 ap-logs-b2b-car-yyyy.MM.dd
+    .WriteTo.Logger(lc => lc
+        .Filter.ByIncludingOnly(e => IsMatching(e, "B2B", "CAR"))
+        .WriteTo.Elasticsearch(GetSinkOptions(builder.Configuration, "b2b", "car")))
+
+    // 通道 4: 預設 (捕捉沒有被分類到的系統 Log，避免 Log 消失)
+    .WriteTo.Logger(lc => lc
+        .Filter.ByExcluding(e => e.Properties.ContainsKey("Department")) // 排除掉上面已經處理過的
+        .WriteTo.Elasticsearch(GetSinkOptions(builder.Configuration, "common", "system")))
+
     .CreateLogger();
 
 // 接管系統 Log
@@ -46,7 +58,6 @@ builder.Host.UseSerilog();
 // ==========================================
 // 2. 註冊 Elastic APM 服務
 // ==========================================
-// 這行會自動讀取 appsettings 的 ElasticApm 設定，並注入監控服務
 builder.Services.AddAllElasticApm();
 
 builder.Services.AddControllers();
@@ -54,8 +65,6 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
-
-// 這裡不需要額外呼叫 UseAllElasticApm，AddAllElasticApm 已自動處理 Middleware 注入
 
 if (app.Environment.IsDevelopment())
 {
@@ -68,3 +77,49 @@ app.UseAuthorization();
 app.MapControllers();
 
 app.Run();
+
+// =========================================================================
+// [新增] 輔助方法區 (放在 Program.cs 最下方即可)
+// =========================================================================
+
+/// <summary>
+/// 產生 Elasticsearch 設定物件，動態組裝 Index 名稱
+/// </summary>
+static ElasticsearchSinkOptions GetSinkOptions(IConfiguration configuration, string dept, string type)
+{
+    // 注意：這裡將日期部分改成 {0:yyyy.MM.dd} 讓 Sink 執行時動態替換
+    var indexPattern = $"aplogs-{dept.ToLower()}-{type.ToLower()}-{{0:yyyy.MM.dd}}";
+    return new ElasticsearchSinkOptions(new Uri(configuration["Elasticsearch:Uri"] ?? "http://localhost:9200"))
+    {
+        CustomFormatter = new EcsTextFormatter(),
+        IndexFormat = indexPattern, // 傳入帶有格式化參數的字串
+        AutoRegisterTemplate = true,
+        AutoRegisterTemplateVersion = AutoRegisterTemplateVersion.ESv7, // 建議明確指定
+        NumberOfShards = 1,
+        NumberOfReplicas = 0
+    };
+}
+
+/// <summary>
+/// 判斷 Log 是否符合特定的部門與險種
+/// </summary>
+static bool IsMatching(LogEvent logEvent, string targetDept, string targetType)
+{
+    // 檢查是否有 Department 屬性且值相符
+    var isDeptMatch = logEvent.Properties.TryGetValue("Department", out var deptVal) &&
+                      GetValue(deptVal) == targetDept;
+
+    // 檢查是否有 InsuranceType 屬性且值相符
+    var isTypeMatch = logEvent.Properties.TryGetValue("InsuranceType", out var typeVal) &&
+                      GetValue(typeVal) == targetType;
+
+    return isDeptMatch && isTypeMatch;
+}
+
+/// <summary>
+/// 簡單取得 LogEventProperty 的字串值 (去除引號)
+/// </summary>
+static string GetValue(LogEventPropertyValue value)
+{
+    return value.ToString().Trim('"');
+}
